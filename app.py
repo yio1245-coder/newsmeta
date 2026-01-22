@@ -16,7 +16,7 @@ DATA_DEFAULT_PATH = "newsmeta.csv"
 
 
 # -----------------------
-# Utilities
+# Font
 # -----------------------
 def find_malgun_font():
     """Try common Malgun Gothic paths (Windows)."""
@@ -30,6 +30,9 @@ def find_malgun_font():
     return None
 
 
+# -----------------------
+# Google Drive helpers
+# -----------------------
 def extract_gdrive_file_id(url: str) -> str | None:
     """
     Accepts Google Drive share links such as:
@@ -41,12 +44,10 @@ def extract_gdrive_file_id(url: str) -> str | None:
     if not url:
         return None
 
-    # /file/d/<id>/
     m = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
     if m:
         return m.group(1)
 
-    # id=<id>
     m = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
     if m:
         return m.group(1)
@@ -55,16 +56,11 @@ def extract_gdrive_file_id(url: str) -> str | None:
 
 
 def gdrive_direct_download_url(file_id: str) -> str:
-    # Widely used direct download pattern:
-    # https://drive.google.com/uc?export=download&id=FILE_ID
     return f"https://drive.google.com/uc?export=download&id={file_id}"
 
 
 def download_to_tempfile(url: str) -> str:
-    """
-    Download URL content to a temporary file and return file path.
-    Stream download to avoid holding everything in memory.
-    """
+    """Stream-download to a tempfile and return its path."""
     tmp = tempfile.NamedTemporaryFile(delete=False)
     tmp_path = tmp.name
     tmp.close()
@@ -79,14 +75,58 @@ def download_to_tempfile(url: str) -> str:
     return tmp_path
 
 
+# -----------------------
+# CSV reader with encoding fallback
+# -----------------------
+def read_csv_with_fallback(path_or_buffer, is_gz=False) -> pd.DataFrame:
+    """
+    Try multiple encodings to handle Korean CSVs (cp949/euc-kr).
+    """
+    encodings_to_try = ["utf-8", "utf-8-sig", "cp949", "euc-kr"]
+
+    last_err = None
+    for enc in encodings_to_try:
+        try:
+            if is_gz:
+                return pd.read_csv(
+                    path_or_buffer,
+                    dtype=str,
+                    keep_default_na=False,
+                    compression="gzip",
+                    encoding=enc,
+                )
+            else:
+                return pd.read_csv(
+                    path_or_buffer,
+                    dtype=str,
+                    keep_default_na=False,
+                    encoding=enc,
+                )
+        except UnicodeDecodeError as e:
+            last_err = e
+            continue
+
+    raise last_err
+
+
+# -----------------------
+# Loaders
+# -----------------------
 @st.cache_data(show_spinner=False)
-def load_data_from_path(path_or_buffer) -> tuple[pd.DataFrame, dict]:
+def load_data_from_path(path_or_buffer):
     """
     Load CSV from local path or file-like object.
     Deduplicate fully-identical rows.
     Parse date -> year.
     """
-    df = pd.read_csv(path_or_buffer, dtype=str, keep_default_na=False)
+    name = ""
+    if hasattr(path_or_buffer, "name"):
+        name = path_or_buffer.name.lower()
+    elif isinstance(path_or_buffer, str):
+        name = path_or_buffer.lower()
+
+    is_gz = name.endswith(".gz")
+    df = read_csv_with_fallback(path_or_buffer, is_gz=is_gz)
 
     before = len(df)
     df = df.drop_duplicates(keep="first")
@@ -105,37 +145,33 @@ def load_data_from_path(path_or_buffer) -> tuple[pd.DataFrame, dict]:
 
 
 @st.cache_data(show_spinner=False)
-def load_data_from_url(url: str) -> tuple[pd.DataFrame, dict, str]:
+def load_data_from_url(url: str):
     """
     Load CSV/CSV.GZ from a URL (e.g., Google Drive).
-    - Accepts Google Drive share link OR direct download link.
-    - Downloads to temp file first, then reads with pandas.
-    Returns (df, meta, used_url).
+    Accepts Google Drive share link OR direct download link.
+    Downloads to temp file first, then reads with encoding fallback.
     """
     used_url = url.strip()
 
-    # If it's a Google Drive share link, convert to direct download
+    # Convert Google Drive share link to direct download link
     file_id = extract_gdrive_file_id(used_url)
     if file_id:
         used_url = gdrive_direct_download_url(file_id)
 
-    # Download to tempfile
     tmp_path = download_to_tempfile(used_url)
 
-    # Decide compression by extension in the original user url or used_url
+    # Determine gzip by URL suffix (optional)
     is_gz = used_url.lower().endswith(".gz") or url.lower().endswith(".gz")
-    if is_gz:
-        df = pd.read_csv(tmp_path, dtype=str, keep_default_na=False, compression="gzip")
-    else:
-        df = pd.read_csv(tmp_path, dtype=str, keep_default_na=False)
 
-    # Cleanup temp file after reading (optional; comment out if debugging)
     try:
-        os.remove(tmp_path)
-    except Exception:
-        pass
+        df = read_csv_with_fallback(tmp_path, is_gz=is_gz)
+    finally:
+        # cleanup temp file
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
-    # Dedup + year
     before = len(df)
     df = df.drop_duplicates(keep="first")
     after = len(df)
@@ -152,8 +188,12 @@ def load_data_from_url(url: str) -> tuple[pd.DataFrame, dict, str]:
     return df, meta, used_url
 
 
-def parse_terms(raw):
+# -----------------------
+# Search / co-occurrence utils
+# -----------------------
+def parse_terms(raw: str) -> list[str]:
     terms = [t.strip() for t in raw.split(",") if t.strip()]
+    # dedupe preserving order
     seen = set()
     out = []
     for t in terms:
@@ -163,7 +203,7 @@ def parse_terms(raw):
     return out
 
 
-def filter_by_terms(df, terms, mode):
+def filter_by_terms(df: pd.DataFrame, terms: list[str], mode: str) -> pd.Series:
     if not terms:
         return pd.Series(True, index=df.index)
 
@@ -182,12 +222,13 @@ def filter_by_terms(df, terms, mode):
         return m
 
 
-def tokenize_keywords(cell):
+def tokenize_keywords(cell: str) -> set[str]:
+    # Split by comma, strip, drop empties
     tokens = [t.strip() for t in str(cell).split(",") if t.strip()]
-    return set(tokens)  # B: 기사 1건당 중복 제거
+    return set(tokens)  # B: 기사 1건 내 중복 제거
 
 
-def keyword_cooccurrence(df_filtered, exclude_terms):
+def keyword_cooccurrence(df_filtered: pd.DataFrame, exclude_terms: set[str]) -> Counter:
     c = Counter()
     for cell in df_filtered["키워드"].astype(str):
         toks = tokenize_keywords(cell)
@@ -198,16 +239,19 @@ def keyword_cooccurrence(df_filtered, exclude_terms):
 
 
 # -----------------------
-# Sidebar: data source
+# Sidebar: Data source
 # -----------------------
 st.sidebar.header("데이터 불러오기")
-
 st.sidebar.caption(
-    "권장: Google Drive 공유 링크(URL) 입력 → 앱이 다운로드해서 읽습니다.\n"
-    "보조: 작은 파일이면 업로드도 가능합니다."
+    "GitHub에는 코드만 두고, 데이터는 Google Drive에 두는 방식입니다.\n"
+    "권장: Google Drive URL로 로딩"
 )
 
-data_source = st.sidebar.radio("데이터 소스", ["Google Drive URL (권장)", "파일 업로드", "로컬 파일(newsmeta.csv)"], index=0)
+data_source = st.sidebar.radio(
+    "데이터 소스",
+    ["Google Drive URL (권장)", "파일 업로드", "로컬 파일(newsmeta.csv)"],
+    index=0,
+)
 
 df = None
 meta = None
@@ -215,22 +259,22 @@ meta = None
 if data_source == "Google Drive URL (권장)":
     url = st.sidebar.text_input("Google Drive 공유 링크 또는 직접 다운로드 링크", value="")
     st.sidebar.caption(
-        "공유 링크 예: https://drive.google.com/file/d/FILE_ID/view?usp=sharing\n"
+        "예: https://drive.google.com/file/d/FILE_ID/view?usp=sharing\n"
         "앱이 자동으로 직접 다운로드 링크로 변환합니다."
     )
-    if url:
-        try:
-            with st.spinner("데이터 다운로드 및 로딩 중..."):
-                df, meta, used_url = load_data_from_url(url)
-            st.sidebar.success("로드 완료")
-            st.sidebar.write("사용한 다운로드 URL:")
-            st.sidebar.code(used_url)
-        except Exception as e:
-            st.sidebar.error("로드 실패")
-            st.sidebar.write(str(e))
-            st.stop()
-    else:
-        st.info("사이드바에 Google Drive 링크를 붙여넣어 주세요.")
+    if not url:
+        st.info("왼쪽 사이드바에 Google Drive 링크를 붙여넣어 주세요.")
+        st.stop()
+
+    try:
+        with st.spinner("데이터 다운로드 및 로딩 중..."):
+            df, meta, used_url = load_data_from_url(url)
+        st.sidebar.success("로드 완료")
+        st.sidebar.write("사용한 다운로드 URL:")
+        st.sidebar.code(used_url)
+    except Exception as e:
+        st.sidebar.error("로드 실패")
+        st.sidebar.write(str(e))
         st.stop()
 
 elif data_source == "파일 업로드":
@@ -238,28 +282,24 @@ elif data_source == "파일 업로드":
     if uploaded is None:
         st.info("사이드바에서 CSV(또는 csv.gz)를 업로드해 주세요.")
         st.stop()
+
     try:
-        if uploaded.name.lower().endswith(".gz"):
-            df, meta = load_data_from_path(uploaded)  # pandas가 내부에서 읽음(압축은 확장자 기반이 아님)
-            # 위 함수는 compression을 지정하지 않으므로, gz 업로드면 아래처럼 읽는 게 더 안전:
-            # df = pd.read_csv(uploaded, dtype=str, keep_default_na=False, compression="gzip")
-            # ... (여기서는 URL 방식이 권장이라 업로드는 보조로 둠)
-        else:
-            df, meta = load_data_from_path(uploaded)
+        df, meta = load_data_from_path(uploaded)
     except Exception as e:
         st.sidebar.error("업로드 파일 로딩 실패")
         st.sidebar.write(str(e))
         st.stop()
 
-else:  # local default
+else:  # local
     if not os.path.exists(DATA_DEFAULT_PATH):
         st.error("newsmeta.csv 파일이 없어요. (로컬 파일 모드)")
         st.stop()
+
     df, meta = load_data_from_path(DATA_DEFAULT_PATH)
 
 
 # -----------------------
-# Sidebar: data health
+# Sidebar: Data health
 # -----------------------
 st.sidebar.subheader("데이터 상태")
 st.sidebar.write(f"- 원본 행 수: {meta['rows_before']:,}")
@@ -270,10 +310,9 @@ if meta["bad_dates"] > 0:
 
 
 # -----------------------
-# Sidebar: search controls
+# Sidebar: Search
 # -----------------------
 st.sidebar.header("검색")
-
 raw_terms = st.sidebar.text_input("특성추출 검색어 (콤마로 구분)", "")
 mode = st.sidebar.radio("검색 조건", ["OR", "AND"], horizontal=True)
 terms = parse_terms(raw_terms)
@@ -346,6 +385,7 @@ with right:
     font_path = find_malgun_font()
     if font_path is None:
         st.warning("맑은고딕 폰트 경로를 찾지 못했어요. 한글이 깨질 수 있어요.")
+
     if counter:
         wc = WordCloud(
             font_path=font_path,
@@ -353,10 +393,14 @@ with right:
             height=520,
             background_color="white",
         ).generate_from_frequencies(dict(counter))
+
         fig, ax = plt.subplots()
         ax.imshow(wc, interpolation="bilinear")
         ax.axis("off")
         st.pyplot(fig, use_container_width=True)
+    else:
+        st.info("워드클라우드를 만들 데이터가 없어요.")
+
 
 st.subheader("기사 목록 (최대 300건)")
 cols = ["일자", "연도", "언론사", "제목"]
