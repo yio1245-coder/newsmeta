@@ -120,6 +120,7 @@ def load_data_from_path(path_or_buffer):
     Parse date -> year.
     """
     name = ""
+    
     if hasattr(path_or_buffer, "name"):
         name = path_or_buffer.name.lower()
     elif isinstance(path_or_buffer, str):
@@ -317,14 +318,28 @@ raw_terms = st.sidebar.text_input("특성추출 검색어 (콤마로 구분)", "
 mode = st.sidebar.radio("검색 조건", ["OR", "AND"], horizontal=True)
 terms = parse_terms(raw_terms)
 
-year_min = int(df["연도"].dropna().min())
-year_max = int(df["연도"].dropna().max())
-year_range = st.sidebar.slider(
-    "연도 범위",
-    min_value=year_min,
-    max_value=year_max,
-    value=(year_min, year_max),
-)
+# --- Year range (SAFE) ---
+years = df["연도"].dropna()
+
+if years.empty:
+    st.sidebar.error("연도 정보를 만들 수 없어요. '일자' 형식/인코딩을 확인해주세요.")
+    st.stop()
+
+years = years.astype(int)
+year_min = int(years.min())
+year_max = int(years.max())
+
+if year_min == year_max:
+    year_range = (year_min, year_max)
+    st.sidebar.info(f"데이터 연도가 {year_min}년 한 해만 있어요.")
+else:
+    year_range = st.sidebar.slider(
+        "연도 범위",
+        min_value=year_min,
+        max_value=year_max,
+        value=(year_min, year_max),
+    )
+
 
 
 # -----------------------
