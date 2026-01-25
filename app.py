@@ -16,12 +16,17 @@ DATA_DEFAULT_PATH = "newsmeta.csv"
 
 
 # -----------------------
-# Font
+# Font (Cloud-friendly)
 # -----------------------
-def find_malgun_font():
-    """Try common Malgun Gothic paths (Windows)."""
+def find_korean_font():
+    """
+    Prefer a bundled font in the repo for Streamlit Cloud.
+    Put NanumGothic.ttf at: fonts/NanumGothic.ttf
+    """
     candidates = [
-        r"C:\Windows\Fonts\malgun.ttf",
+        "fonts/NanumGothic.ttf",  # recommended: repo-bundled font
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",  # some linux images
+        r"C:\Windows\Fonts\malgun.ttf",  # windows local
         r"C:\Windows\Fonts\malgunbd.ttf",
     ]
     for p in candidates:
@@ -120,7 +125,6 @@ def load_data_from_path(path_or_buffer):
     Parse date -> year.
     """
     name = ""
-    
     if hasattr(path_or_buffer, "name"):
         name = path_or_buffer.name.lower()
     elif isinstance(path_or_buffer, str):
@@ -135,6 +139,8 @@ def load_data_from_path(path_or_buffer):
 
     df["일자_dt"] = pd.to_datetime(df["일자"], errors="coerce")
     df["연도"] = df["일자_dt"].dt.year
+    # --- force integer-like year (prevents 1997.0) ---
+    df["연도"] = pd.to_numeric(df["연도"], errors="coerce").astype("Int64")
 
     meta = {
         "rows_before": before,
@@ -179,6 +185,8 @@ def load_data_from_url(url: str):
 
     df["일자_dt"] = pd.to_datetime(df["일자"], errors="coerce")
     df["연도"] = df["일자_dt"].dt.year
+    # --- force integer-like year (prevents 1997.0) ---
+    df["연도"] = pd.to_numeric(df["연도"], errors="coerce").astype("Int64")
 
     meta = {
         "rows_before": before,
@@ -318,9 +326,8 @@ raw_terms = st.sidebar.text_input("특성추출 검색어 (콤마로 구분)", "
 mode = st.sidebar.radio("검색 조건", ["OR", "AND"], horizontal=True)
 terms = parse_terms(raw_terms)
 
-# --- Year range (SAFE) ---
+# --- SAFE Year range ---
 years = df["연도"].dropna()
-
 if years.empty:
     st.sidebar.error("연도 정보를 만들 수 없어요. '일자' 형식/인코딩을 확인해주세요.")
     st.stop()
@@ -341,13 +348,16 @@ else:
     )
 
 
-
 # -----------------------
 # Filtering
 # -----------------------
 mask_terms = filter_by_terms(df, terms, mode)
 mask_year = df["연도"].between(year_range[0], year_range[1])
 df_f = df.loc[mask_terms & mask_year].copy()
+
+# Ensure year is int for plotting (prevents floats)
+df_f = df_f[df_f["연도"].notna()].copy()
+df_f["연도"] = df_f["연도"].astype(int)
 
 
 # -----------------------
@@ -366,6 +376,7 @@ with left:
     st.subheader("연도별 기사 수")
     yearly = df_f.groupby("연도").size().reset_index(name="기사수").sort_values("연도")
     fig_year = px.bar(yearly, x="연도", y="기사수")
+    fig_year.update_xaxes(tickformat="d")  # <-- no decimals
     st.plotly_chart(fig_year, use_container_width=True)
 
     st.subheader("언론사 분포 (상위 30)")
@@ -397,11 +408,10 @@ with right:
         st.info("공동출현 결과가 없습니다. 검색어/연도 범위를 바꿔보세요.")
 
     st.subheader("워드클라우드")
-    font_path = find_malgun_font()
+    font_path = find_korean_font()
     if font_path is None:
-        st.warning("맑은고딕 폰트 경로를 찾지 못했어요. 한글이 깨질 수 있어요.")
-
-    if counter:
+        st.warning("한글 폰트(NanumGothic.ttf)를 찾지 못했어요. repo에 fonts/NanumGothic.ttf를 추가해 주세요.")
+    if counter and font_path:
         wc = WordCloud(
             font_path=font_path,
             width=900,
@@ -413,7 +423,7 @@ with right:
         ax.imshow(wc, interpolation="bilinear")
         ax.axis("off")
         st.pyplot(fig, use_container_width=True)
-    else:
+    elif not counter:
         st.info("워드클라우드를 만들 데이터가 없어요.")
 
 
